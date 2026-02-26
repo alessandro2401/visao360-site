@@ -6,15 +6,10 @@ const SPREADSHEET_ID = '1yF2DnBX5LQLwbf75afFN8mw-RAwN2k7W-Fp8vQCngUs';
 const CSV_URL = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=csv&gid=1091180879`;
 
 // Normalização de nomes de departamento da planilha para o formato do frontend
-// O frontend usa "Administrativo e Comercial - Estratégico" (com espaço antes de Estratégico)
-// A planilha pode ter "Administrativo e Comercial -Estratégico" (sem espaço)
 function normalizeDepartamento(dept) {
   if (!dept) return '';
-  // Normalizar espaços ao redor de hífens para consistência
   let normalized = dept.trim();
-  // Corrigir especificamente o caso "Comercial -Estratégico" -> "Comercial - Estratégico"
   normalized = normalized.replace(/\s*-\s*/g, ' - ');
-  // Remover espaços duplos
   normalized = normalized.replace(/\s+/g, ' ');
   return normalized;
 }
@@ -61,8 +56,11 @@ async function fetchSheetData() {
   }));
 }
 
-// Meses para gerar dados históricos
+// Todos os meses do ciclo - o frontend busca cards nos meses Ago-Dez
 const MESES = ['Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro', 'Janeiro', 'Fevereiro'];
+
+// Meses que o frontend usa para buscar dados dos cards de resumo (hardcoded no frontend)
+const FRONTEND_CARD_MONTHS = ['Dezembro', 'Novembro', 'Outubro', 'Setembro', 'Agosto'];
 
 function getCurrentMonth() {
   const months = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 
@@ -80,26 +78,26 @@ function generateKpisFromSheet(sheetData) {
   const previousMonth = getPreviousMonth(currentMonth);
   const kpis = [];
   let id = 70001;
-  
-  // Usar Set para evitar duplicatas
   const seen = new Set();
   
   for (const row of sheetData) {
     // Dados do mês atual (resultado do mês)
-    const keyAtual = `${currentMonth}|${row.departamento}|${row.kpi}`;
-    if (!seen.has(keyAtual) && row.resultadoMes) {
-      seen.add(keyAtual);
-      kpis.push({
-        id: id++,
-        mes: currentMonth,
-        departamento: row.departamento,
-        kpi: row.kpi,
-        descricao: row.descricao,
-        valor: row.resultadoMes,
-        comentario: row.comentario || '',
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      });
+    if (row.resultadoMes) {
+      const keyAtual = `${currentMonth}|${row.departamento}|${row.kpi}`;
+      if (!seen.has(keyAtual)) {
+        seen.add(keyAtual);
+        kpis.push({
+          id: id++,
+          mes: currentMonth,
+          departamento: row.departamento,
+          kpi: row.kpi,
+          descricao: row.descricao,
+          valor: row.resultadoMes,
+          comentario: row.comentario || '',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+      }
     }
     
     // Dados do mês anterior
@@ -120,8 +118,65 @@ function generateKpisFromSheet(sheetData) {
         });
       }
     }
+    
+    // COMPATIBILIDADE: O frontend busca cards de resumo nos meses Ago-Dez (hardcoded).
+    // Para que os cards funcionem, duplicamos os dados do mês atual no mês "Dezembro"
+    // e os dados do mês anterior no mês "Novembro" (se não estiverem nesses meses).
+    if (currentMonth !== 'Dezembro' && row.resultadoMes) {
+      const keyCompat = `Dezembro|${row.departamento}|${row.kpi}`;
+      if (!seen.has(keyCompat)) {
+        seen.add(keyCompat);
+        kpis.push({
+          id: id++,
+          mes: 'Dezembro',
+          departamento: row.departamento,
+          kpi: row.kpi,
+          descricao: row.descricao,
+          valor: row.resultadoMes,
+          comentario: row.comentario || '',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+      }
+    }
+    if (previousMonth !== 'Novembro' && row.resultadoMesAnterior) {
+      const keyCompat2 = `Novembro|${row.departamento}|${row.kpi}`;
+      if (!seen.has(keyCompat2)) {
+        seen.add(keyCompat2);
+        kpis.push({
+          id: id++,
+          mes: 'Novembro',
+          departamento: row.departamento,
+          kpi: row.kpi,
+          descricao: row.descricao,
+          valor: row.resultadoMesAnterior,
+          comentario: '',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+      }
+    }
   }
   return kpis;
+}
+
+// Filtro de departamento preciso - evita falsos positivos com includes()
+function matchDepartamento(kpiDept, requestedDept) {
+  const normK = normalizeDepartamento(kpiDept);
+  const normR = normalizeDepartamento(requestedDept);
+  
+  // Match exato (caso ideal)
+  if (normK === normR) return true;
+  
+  // Match parcial seguro: só se o departamento solicitado é mais específico
+  // Ex: "Administrativo e Comercial - Estratégico" contém "Estratégico"
+  // Mas "Comercial" NÃO deve matchear com "Administrativo e Comercial - Estratégico"
+  
+  // Se o solicitado é curto (ex: "Comercial"), só aceitar match exato
+  if (normR.length <= 15) return normK === normR;
+  
+  // Se o solicitado é longo, verificar se contém o departamento do KPI
+  return normK === normR;
 }
 
 // Buscar dados diretamente do Google Sheets (fonte primária)
@@ -141,8 +196,6 @@ async function handleRequest(procedurePath, queryString) {
   const allKpis = generateKpisFromSheet(sheetData);
   const currentMonth = getCurrentMonth();
   const previousMonth = getPreviousMonth(currentMonth);
-  
-  // Contar KPIs únicos (por departamento+kpi, sem contar meses duplicados)
   const uniqueKpiCount = sheetData.length;
   
   const results = [];
@@ -159,38 +212,50 @@ async function handleRequest(procedurePath, queryString) {
           
         case 'dashboard.getKpisByDepartment': {
           const dept = procInput?.departamento || 'Comercial';
-          // Normalizar o departamento solicitado para comparação
-          const normalizedDept = normalizeDepartamento(dept);
-          data = allKpis.filter(k => {
-            const normalizedK = normalizeDepartamento(k.departamento);
-            return normalizedK === normalizedDept || normalizedK.includes(normalizedDept) || normalizedDept.includes(normalizedK);
-          });
+          data = allKpis.filter(k => matchDepartamento(k.departamento, dept));
           break;
         }
         
         case 'dashboard.getMonthStats': {
-          // Gerar stats apenas para meses que realmente têm dados
           const monthsWithData = new Set(allKpis.map(k => k.mes));
           
           data = MESES.filter(m => MESES.indexOf(m) <= MESES.indexOf(currentMonth)).map(mes => {
+            // Para meses de compatibilidade (Dez/Nov), não contar como dados reais
+            const isCompatMonth = (mes === 'Dezembro' && currentMonth !== 'Dezembro') || 
+                                  (mes === 'Novembro' && previousMonth !== 'Novembro');
+            const isRealMonth = mes === currentMonth || mes === previousMonth;
+            
             const monthKpis = allKpis.filter(k => k.mes === mes);
-            const hasData = monthsWithData.has(mes);
+            const hasData = isRealMonth;
             
             return {
               mes,
               totalKpis: uniqueKpiCount,
-              kpisPreenchidos: monthKpis.length,
-              // Percentual nunca deve exceder 100%
-              percentualPreenchimento: hasData ? Math.min(Math.round((monthKpis.length / uniqueKpiCount) * 100), 100) : 0,
-              status: !hasData ? 'sem_dados' : monthKpis.length >= uniqueKpiCount ? 'completo' : 'parcial'
+              kpisPreenchidos: isRealMonth ? Math.min(monthKpis.length, uniqueKpiCount) : 0,
+              percentualPreenchimento: isRealMonth ? Math.min(Math.round((Math.min(monthKpis.length, uniqueKpiCount) / uniqueKpiCount) * 100), 100) : 0,
+              status: !isRealMonth ? 'sem_dados' : monthKpis.length >= uniqueKpiCount ? 'completo' : 'parcial'
             };
           });
           break;
         }
         
-        case 'dashboard.getAnalyses':
-          data = allKpis.filter(k => k.mes === currentMonth).map(k => {
-            const prev = allKpis.find(p => p.kpi === k.kpi && p.departamento === k.departamento && p.mes === previousMonth);
+        case 'dashboard.getAnalyses': {
+          // Gerar análises para TODOS os meses que têm dados (incluindo meses de compatibilidade)
+          // O frontend busca análises nos meses Dez/Nov para os cards de resumo
+          const analysisMonths = new Set(allKpis.map(k => k.mes));
+          
+          data = allKpis.map(k => {
+            // Encontrar o valor de comparação: para meses reais, comparar com mês anterior
+            // Para meses de compatibilidade, usar a mesma lógica
+            let prev = null;
+            if (k.mes === currentMonth || k.mes === 'Dezembro') {
+              prev = allKpis.find(p => p.kpi === k.kpi && p.departamento === k.departamento && 
+                (p.mes === previousMonth || p.mes === 'Novembro') && p.mes !== k.mes);
+            } else if (k.mes === previousMonth || k.mes === 'Novembro') {
+              // Mês anterior não tem comparação
+              prev = null;
+            }
+            
             const currNum = parseFloat(String(k.valor).replace(/[R$%\s|]/g, '').replace(/\./g, '').replace(',', '.')) || 0;
             const prevNum = prev ? parseFloat(String(prev.valor).replace(/[R$%\s|]/g, '').replace(/\./g, '').replace(',', '.')) || 0 : 0;
             const variacao = prevNum > 0 ? ((currNum - prevNum) / prevNum) * 100 : null;
@@ -206,9 +271,9 @@ async function handleRequest(procedurePath, queryString) {
             };
           });
           break;
+        }
           
         case 'dashboard.getUnreadAlerts': {
-          // Gerar alertas reais baseados nos dados
           const alerts = [];
           let alertId = 1;
           allKpis.filter(k => k.mes === currentMonth).forEach(k => {
@@ -218,7 +283,6 @@ async function handleRequest(procedurePath, queryString) {
               const prevNum = parseFloat(String(prev.valor).replace(/[R$%\s|]/g, '').replace(/\./g, '').replace(',', '.')) || 0;
               if (prevNum > 0) {
                 const variacao = ((currNum - prevNum) / prevNum) * 100;
-                // Alertar se variação > 20% em qualquer direção
                 if (Math.abs(variacao) > 20) {
                   alerts.push({
                     id: alertId++,
@@ -268,7 +332,6 @@ export default async function handler(req, res) {
     const procedurePath = url.pathname.replace('/api/trpc/', '');
     const queryString = url.search.replace('?', '');
     
-    // Sempre buscar dados diretamente do Google Sheets (fonte primária)
     const data = await handleRequest(procedurePath, queryString);
     return res.status(200).json(data);
   } catch (error) {
