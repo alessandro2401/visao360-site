@@ -1,20 +1,23 @@
 // API Serverless - Dashboard Visão 360° 
-// Proxy para a API original no manus.space + sincronização com Google Sheets
-// Garante compatibilidade total com o frontend
+// Sincronização direta com Google Sheets (fonte primária de dados)
+// Compatível com o frontend tRPC
 
-const ORIGINAL_API = 'https://visao360.manus.space/api/trpc';
 const SPREADSHEET_ID = '1yF2DnBX5LQLwbf75afFN8mw-RAwN2k7W-Fp8vQCngUs';
 const CSV_URL = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=csv&gid=1091180879`;
 
-// Mapeamento de departamentos da planilha para o formato do banco
-const DEPT_MAP = {
-  'Comercial': 'Comercial',
-  'Administrativo - Financeiro': 'Administrativo - Financeiro',
-  'Administrativo - Atendimento': 'Administrativo - Atendimento',
-  'Administrativo - Sinistro': 'Administrativo - Sinistro',
-  'Administrativo e Comercial -Estratégico': 'Administrativo e Comercial -Estratégico',
-  'Jurídico': 'Jurídico'
-};
+// Normalização de nomes de departamento da planilha para o formato do frontend
+// O frontend usa "Administrativo e Comercial - Estratégico" (com espaço antes de Estratégico)
+// A planilha pode ter "Administrativo e Comercial -Estratégico" (sem espaço)
+function normalizeDepartamento(dept) {
+  if (!dept) return '';
+  // Normalizar espaços ao redor de hífens para consistência
+  let normalized = dept.trim();
+  // Corrigir especificamente o caso "Comercial -Estratégico" -> "Comercial - Estratégico"
+  normalized = normalized.replace(/\s*-\s*/g, ' - ');
+  // Remover espaços duplos
+  normalized = normalized.replace(/\s+/g, ' ');
+  return normalized;
+}
 
 function parseCSV(text) {
   const rows = [];
@@ -49,7 +52,7 @@ async function fetchSheetData() {
   const text = await response.text();
   const rows = parseCSV(text);
   return rows.slice(1).filter(row => row.length >= 4 && row[0]).map(row => ({
-    departamento: row[0] || '',
+    departamento: normalizeDepartamento(row[0]),
     kpi: row[1] || '',
     descricao: row[2] || '',
     resultadoMes: row[3] || '',
@@ -67,72 +70,62 @@ function getCurrentMonth() {
   return months[new Date().getMonth()];
 }
 
+function getPreviousMonth(currentMonth) {
+  const idx = MESES.indexOf(currentMonth);
+  return idx > 0 ? MESES[idx - 1] : null;
+}
+
 function generateKpisFromSheet(sheetData) {
   const currentMonth = getCurrentMonth();
+  const previousMonth = getPreviousMonth(currentMonth);
   const kpis = [];
   let id = 70001;
   
+  // Usar Set para evitar duplicatas
+  const seen = new Set();
+  
   for (const row of sheetData) {
     // Dados do mês atual (resultado do mês)
-    kpis.push({
-      id: id++,
-      mes: currentMonth,
-      departamento: row.departamento,
-      kpi: row.kpi,
-      descricao: row.descricao,
-      valor: row.resultadoMes,
-      comentario: row.comentario || '',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    });
-    
-    // Dados do mês anterior
-    const prevMonthIdx = MESES.indexOf(currentMonth) - 1;
-    if (prevMonthIdx >= 0 && row.resultadoMesAnterior) {
+    const keyAtual = `${currentMonth}|${row.departamento}|${row.kpi}`;
+    if (!seen.has(keyAtual) && row.resultadoMes) {
+      seen.add(keyAtual);
       kpis.push({
         id: id++,
-        mes: MESES[prevMonthIdx],
+        mes: currentMonth,
         departamento: row.departamento,
         kpi: row.kpi,
         descricao: row.descricao,
-        valor: row.resultadoMesAnterior,
-        comentario: '',
+        valor: row.resultadoMes,
+        comentario: row.comentario || '',
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       });
+    }
+    
+    // Dados do mês anterior
+    if (previousMonth && row.resultadoMesAnterior) {
+      const keyAnterior = `${previousMonth}|${row.departamento}|${row.kpi}`;
+      if (!seen.has(keyAnterior)) {
+        seen.add(keyAnterior);
+        kpis.push({
+          id: id++,
+          mes: previousMonth,
+          departamento: row.departamento,
+          kpi: row.kpi,
+          descricao: row.descricao,
+          valor: row.resultadoMesAnterior,
+          comentario: '',
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+      }
     }
   }
   return kpis;
 }
 
-// Tentar buscar da API original primeiro, fallback para Google Sheets
-async function proxyOrFallback(procedurePath, queryString, method, body) {
-  try {
-    // Tentar proxy para a API original
-    const url = `${ORIGINAL_API}/${procedurePath}${queryString ? '?' + queryString : ''}`;
-    const options = {
-      method: method || 'GET',
-      headers: { 'Content-Type': 'application/json' },
-      signal: AbortSignal.timeout(5000) // 5s timeout
-    };
-    if (method === 'POST' && body) {
-      options.body = typeof body === 'string' ? body : JSON.stringify(body);
-    }
-    const response = await fetch(url, options);
-    if (response.ok) {
-      const data = await response.json();
-      return data;
-    }
-  } catch (e) {
-    // Proxy falhou, usar fallback
-    console.log('Proxy failed, using fallback:', e.message);
-  }
-  
-  // Fallback: gerar dados a partir do Google Sheets
-  return await handleFallback(procedurePath, queryString);
-}
-
-async function handleFallback(procedurePath, queryString) {
+// Buscar dados diretamente do Google Sheets (fonte primária)
+async function handleRequest(procedurePath, queryString) {
   const procedures = procedurePath.split(',').map(p => p.trim()).filter(Boolean);
   
   let inputMap = {};
@@ -147,6 +140,10 @@ async function handleFallback(procedurePath, queryString) {
   const sheetData = await fetchSheetData();
   const allKpis = generateKpisFromSheet(sheetData);
   const currentMonth = getCurrentMonth();
+  const previousMonth = getPreviousMonth(currentMonth);
+  
+  // Contar KPIs únicos (por departamento+kpi, sem contar meses duplicados)
+  const uniqueKpiCount = sheetData.length;
   
   const results = [];
   for (let i = 0; i < procedures.length; i++) {
@@ -159,26 +156,41 @@ async function handleFallback(procedurePath, queryString) {
         case 'dashboard.getAllKpis':
           data = allKpis;
           break;
+          
         case 'dashboard.getKpisByDepartment': {
           const dept = procInput?.departamento || 'Comercial';
-          data = allKpis.filter(k => k.departamento === dept || k.departamento.includes(dept));
+          // Normalizar o departamento solicitado para comparação
+          const normalizedDept = normalizeDepartamento(dept);
+          data = allKpis.filter(k => {
+            const normalizedK = normalizeDepartamento(k.departamento);
+            return normalizedK === normalizedDept || normalizedK.includes(normalizedDept) || normalizedDept.includes(normalizedK);
+          });
           break;
         }
-        case 'dashboard.getMonthStats':
+        
+        case 'dashboard.getMonthStats': {
+          // Gerar stats apenas para meses que realmente têm dados
+          const monthsWithData = new Set(allKpis.map(k => k.mes));
+          
           data = MESES.filter(m => MESES.indexOf(m) <= MESES.indexOf(currentMonth)).map(mes => {
             const monthKpis = allKpis.filter(k => k.mes === mes);
+            const hasData = monthsWithData.has(mes);
+            
             return {
               mes,
-              totalKpis: sheetData.length,
+              totalKpis: uniqueKpiCount,
               kpisPreenchidos: monthKpis.length,
-              percentualPreenchimento: Math.round((monthKpis.length / sheetData.length) * 100),
-              status: monthKpis.length >= sheetData.length ? 'completo' : 'parcial'
+              // Percentual nunca deve exceder 100%
+              percentualPreenchimento: hasData ? Math.min(Math.round((monthKpis.length / uniqueKpiCount) * 100), 100) : 0,
+              status: !hasData ? 'sem_dados' : monthKpis.length >= uniqueKpiCount ? 'completo' : 'parcial'
             };
           });
           break;
+        }
+        
         case 'dashboard.getAnalyses':
-          data = allKpis.map(k => {
-            const prev = allKpis.find(p => p.kpi === k.kpi && p.departamento === k.departamento && p.mes !== k.mes);
+          data = allKpis.filter(k => k.mes === currentMonth).map(k => {
+            const prev = allKpis.find(p => p.kpi === k.kpi && p.departamento === k.departamento && p.mes === previousMonth);
             const currNum = parseFloat(String(k.valor).replace(/[R$%\s|]/g, '').replace(/\./g, '').replace(',', '.')) || 0;
             const prevNum = prev ? parseFloat(String(prev.valor).replace(/[R$%\s|]/g, '').replace(/\./g, '').replace(',', '.')) || 0 : 0;
             const variacao = prevNum > 0 ? ((currNum - prevNum) / prevNum) * 100 : null;
@@ -188,21 +200,51 @@ async function handleFallback(procedurePath, queryString) {
               kpi: k.kpi,
               valor: k.valor,
               valorNumerico: currNum,
-              variacao,
+              variacao: variacao !== null ? Math.round(variacao * 10) / 10 : null,
               tendencia: variacao === null ? 'estavel' : variacao > 0 ? 'melhora' : variacao < 0 ? 'piora' : 'estavel',
               status: 'normal'
             };
           });
           break;
-        case 'dashboard.getUnreadAlerts':
-          data = [];
+          
+        case 'dashboard.getUnreadAlerts': {
+          // Gerar alertas reais baseados nos dados
+          const alerts = [];
+          let alertId = 1;
+          allKpis.filter(k => k.mes === currentMonth).forEach(k => {
+            const prev = allKpis.find(p => p.kpi === k.kpi && p.departamento === k.departamento && p.mes === previousMonth);
+            if (prev) {
+              const currNum = parseFloat(String(k.valor).replace(/[R$%\s|]/g, '').replace(/\./g, '').replace(',', '.')) || 0;
+              const prevNum = parseFloat(String(prev.valor).replace(/[R$%\s|]/g, '').replace(/\./g, '').replace(',', '.')) || 0;
+              if (prevNum > 0) {
+                const variacao = ((currNum - prevNum) / prevNum) * 100;
+                // Alertar se variação > 20% em qualquer direção
+                if (Math.abs(variacao) > 20) {
+                  alerts.push({
+                    id: alertId++,
+                    tipo: variacao > 0 ? 'melhora_significativa' : 'piora_significativa',
+                    departamento: k.departamento,
+                    kpi: k.kpi,
+                    mensagem: `${k.kpi} (${k.departamento}): variação de ${variacao > 0 ? '+' : ''}${Math.round(variacao)}% em relação ao mês anterior`,
+                    lido: false,
+                    createdAt: new Date().toISOString()
+                  });
+                }
+              }
+            }
+          });
+          data = alerts;
           break;
+        }
+        
         case 'dashboard.getLastSync':
           data = { lastSync: new Date().toISOString(), hasData: true };
           break;
+          
         case 'dashboard.sync':
           data = { success: true, syncedAt: new Date().toISOString(), totalKpis: allKpis.length };
           break;
+          
         default:
           data = null;
       }
@@ -226,14 +268,8 @@ export default async function handler(req, res) {
     const procedurePath = url.pathname.replace('/api/trpc/', '');
     const queryString = url.search.replace('?', '');
     
-    // Para sync, sempre usar fallback (atualizar do Google Sheets)
-    if (procedurePath.includes('dashboard.sync')) {
-      const result = await handleFallback(procedurePath, queryString);
-      return res.status(200).json(result);
-    }
-    
-    // Para outros endpoints, tentar proxy primeiro
-    const data = await proxyOrFallback(procedurePath, queryString, req.method, req.body);
+    // Sempre buscar dados diretamente do Google Sheets (fonte primária)
+    const data = await handleRequest(procedurePath, queryString);
     return res.status(200).json(data);
   } catch (error) {
     console.error('API Error:', error);
